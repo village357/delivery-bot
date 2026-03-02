@@ -124,11 +124,14 @@ async def extrair_info(client, image_b64):
                             "type": "text",
                             "text": (
                                 "Esta e uma foto de etiqueta de entrega brasileira. "
-                                "Pode ter um numero escrito a caneta pelo entregador (ex: 6, 12, 35). "
-                                "Responda APENAS em formato JSON assim:\n"
-                                "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", \"endereco\": \"Jardim Planalto, Rua Jose Vencel, Casa 36, Santa Rita do Passa Quatro, SP, CEP 13670-744\"}\n"
-                                "Se nao tiver numero escrito a caneta, coloque null no numero.\n"
-                                "Se nao encontrar endereco, responda: NAO_ENCONTRADO"
+    "Pode ter um numero escrito a caneta pelo entregador (ex: 6, 12, 35). "
+    "Extraia APENAS o endereco do DESTINATARIO (ignore o remetente). "
+    "Responda APENAS em formato JSON assim:\n"
+    "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", \"endereco\": \"Rua Jose Vencel, 36, Jardim Planalto, Santa Rita do Passa Quatro - SP, CEP 13670-744\"}\n"
+    "IMPORTANTE: formate o endereco como: Rua, Numero, Bairro, Cidade - UF, CEP XXXXX-XXX\n"
+    "Isso e essencial para o Google Maps encontrar o lugar certo.\n"
+    "Se nao tiver numero escrito a caneta, coloque null no numero.\n"
+    "Se nao encontrar endereco, responda: NAO_ENCONTRADO
                             )
                         }
                     ]
