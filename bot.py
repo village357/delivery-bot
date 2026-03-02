@@ -8,7 +8,7 @@ import httpx
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-user_photos: dict[int, list[str]] = {}
+user_photos = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -34,7 +34,7 @@ async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_b64 = base64.b64encode(response.content).decode()
     user_photos[user_id].append(image_b64)
     count = len(user_photos[user_id])
-    await update.message.reply_text(f"Foto {count} recebida! Manda mais ou digita /rota para gerar a rota.")
+    await update.message.reply_text("Foto " + str(count) + " recebida! Manda mais ou digita /rota para gerar a rota.")
 
 async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -42,8 +42,8 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not fotos:
         await update.message.reply_text("Nenhuma foto recebida ainda! Manda as fotos dos pacotes primeiro.")
         return
-    await update.message.reply_text(f"Analisando {len(fotos)} foto(s)... Aguarda!")
-    async with httpx.AsyncClient(timeout=30) as client:
+    await update.message.reply_text("Analisando " + str(len(fotos)) + " foto(s)... Aguarda!")
+    async with httpx.AsyncClient(timeout=60) as client:
         tasks = [extrair_endereco(client, foto) for foto in fotos]
         resultados = await asyncio.gather(*tasks, return_exceptions=True)
     enderecos = [r for r in resultados if isinstance(r, str)]
@@ -52,16 +52,16 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nao consegui ler nenhum endereco nas fotos. Tente fotos mais nitidas.")
         return
     destinos = "/".join([addr.replace(" ", "+") for addr in enderecos])
-    maps_url = f"https://www.google.com/maps/dir/{destinos}"
-    lista = "\n".join([f"{i+1}. {addr}" for i, addr in enumerate(enderecos)])
-    msg = f"Rota com {len(enderecos)} parada(s):\n\n{lista}\n\n"
+    maps_url = "https://www.google.com/maps/dir/" + destinos
+    lista = "\n".join([str(i+1) + ". " + addr for i, addr in enumerate(enderecos)])
+    msg = "Rota com " + str(len(enderecos)) + " parada(s):\n\n" + lista + "\n\n"
     if erros > 0:
-        msg += f"{erros} foto(s) nao puderam ser lidas.\n\n"
-    msg += f"Toque no link para abrir no Google Maps:\n{maps_url}"
+        msg += str(erros) + " foto(s) nao puderam ser lidas.\n\n"
+    msg += "Toque no link para abrir no Google Maps:\n" + maps_url
     await update.message.reply_text(msg)
     user_photos[user_id] = []
 
-async def extrair_endereco(client: httpx.AsyncClient, image_b64: str):
+async def extrair_endereco(client, image_b64):
     try:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -94,7 +94,9 @@ async def extrair_endereco(client: httpx.AsyncClient, image_b64: str):
         )
         data = response.json()
         text = data["content"][0]["text"].strip()
-        return None if text == "NAO_ENCONTRADO" else text
+        if text == "NAO_ENCONTRADO":
+            return None
+        return text
     except Exception:
         return None
 
@@ -103,4 +105,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("limpar", limpar))
     app.add_handler(CommandHandler("rota", gerar_rota))
-    app.
+    app.add_handler(MessageHandler(filters.PHOTO, receber_foto))
+    print("Bot rodando...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
