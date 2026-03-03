@@ -141,7 +141,7 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Monta link do Google Maps com encoding correto para acentos
     enderecos = [p["endereco"] for p in pacotes_ordenados]
     destinos = "/".join([quote(e, safe="") for e in enderecos])
-    maps_url = "https://www.google.com/maps/dir/" + destinos
+    maps_url = "https://www.google.com/maps/dir//" + destinos
 
     if erros > 0:
         msg += f"⚠️ {erros} foto(s) não puderam ser lidas.\n\n"
@@ -183,13 +183,16 @@ async def extrair_info(client: httpx.AsyncClient, image_b64: str):
                                 "text": (
                                     "Esta é uma foto de etiqueta de entrega brasileira. "
                                     "Pode ter um número escrito a caneta pelo entregador (ex: 6, 12, 35). "
-                                    "Extraia APENAS o endereço do DESTINATÁRIO (ignore o remetente). "
+                                    "Extraia APENAS o endereço do DESTINATÁRIO (ignore completamente o remetente). "
                                     "Responda APENAS em formato JSON assim:\n"
-                                    "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", \"endereco\": \"Rua Jose Vencel, 36, Jardim Planalto, Santa Rita do Passa Quatro - SP, CEP 13670-744\"}\n"
-                                    "IMPORTANTE: formate o endereco como: Rua, Numero, Bairro, Cidade - UF, CEP XXXXX-XXX\n"
-                                    "Isso é essencial para o Google Maps encontrar o lugar certo.\n"
-                                    "Se não tiver número escrito a caneta, coloque null no numero.\n"
-                                    "Se não encontrar endereço, responda apenas: NAO_ENCONTRADO"
+                                    "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", \"endereco\": \"Rua Jose Vencel, 36, Jardim Planalto, Santa Rita do Passa Quatro, SP, 13670-744\"}\n"
+                                    "REGRAS CRÍTICAS para o campo 'endereco':\n"
+                                    "1. Formato: Rua, Numero, Bairro, Cidade, UF, CEP (sem a palavra CEP, só os números)\n"
+                                    "2. NUNCA escreva o nome completo do estado (ex: nunca 'São Paulo', nunca 'Minas Gerais') — use SEMPRE só a sigla de 2 letras (SP, MG, RJ, etc.)\n"
+                                    "3. Inclua o CEP sem a palavra 'CEP' — só os números com hífen (ex: 13670-744)\n"
+                                    "4. O CEP é o dado mais importante pois garante que o Maps encontre a cidade certa\n"
+                                    "5. Se não tiver número escrito a caneta, coloque null no campo 'numero'\n"
+                                    "6. Se não encontrar endereço, responda apenas: NAO_ENCONTRADO"
                                 )
                             }
                         ]
