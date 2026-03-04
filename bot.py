@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import asyncio
 import json
@@ -79,6 +80,14 @@ async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Manda mais ou digita /rota para gerar a rota."
     )
 
+# ── Extrai CEP numérico do endereço para ordenação ──
+def extrair_cep_numerico(endereco):
+    """Extrai o CEP do endereço e retorna como número para ordenação."""
+    match = re.search(r"(\d{5})-?(\d{3})", endereco)
+    if match:
+        return int(match.group(1) + match.group(2))
+    return 99999999  # Coloca no final se não encontrar CEP
+
 # ── /rota ──
 async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -113,45 +122,72 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Ordena pelo número do pacote (caneta) se houver
-    pacotes_com_num = sorted(
-        [p for p in pacotes if p["numero"] is not None],
-        key=lambda x: x["numero"]
-    )
-    pacotes_sem_num = [p for p in pacotes if p["numero"] is None]
-    pacotes_ordenados = pacotes_com_num + pacotes_sem_num
+    # Remove endereços duplicados (mantém o primeiro encontrado)
+    vistos = set()
+    pacotes_unicos = []
+    for p in pacotes:
+        chave = p["endereco"].strip().lower()
+        if chave not in vistos:
+            vistos.add(chave)
+            pacotes_unicos.append(p)
+        else:
+            logger.info(f"Duplicata removida: {p['endereco']}")
 
-    # Agrupa por bairro
-    bairros = {}
-    for p in pacotes_ordenados:
-        bairro = p["bairro"] or "Outros"
-        if bairro not in bairros:
-            bairros[bairro] = []
-        bairros[bairro].append(p)
+    # Ordena por CEP (proximidade geográfica real)
+    pacotes_ordenados = sorted(pacotes_unicos, key=lambda p: extrair_cep_numerico(p["endereco"]))
 
-    # Monta mensagem agrupada por bairro
-    msg = f"🗺️ Rota com {len(pacotes)} parada(s):\n\n"
-    for bairro, pkgs in bairros.items():
-        msg += f"📍 {bairro}:\n"
-        for p in pkgs:
-            num = f"[Pacote {p['numero']}] " if p["numero"] is not None else ""
-            msg += f"  {num}{p['endereco']}\n"
-        msg += "\n"
+    # Monta mensagem com link individual por parada
+    total = len(pacotes_ordenados)
+    msg = f"🗺️ Rota otimizada — {total} parada(s):\n\n"
 
-    # Monta link do Google Maps com encoding correto para acentos
-    enderecos = [p["endereco"] for p in pacotes_ordenados]
-    destinos = "/".join([quote(e, safe="") for e in enderecos])
-    maps_url = "https://www.google.com/maps/dir//" + destinos
+    for i, p in enumerate(pacotes_ordenados, 1):
+        num = f" [Pacote {p['numero']}]" if p["numero"] is not None else ""
+        bairro = p["bairro"] or "—"
+        link = "https://www.google.com/maps/search/" + quote(p["endereco"], safe="")
+        msg += f"{i}️⃣ {bairro}{num}\n"
+        msg += f"   {p['endereco']}\n"
+        msg += f"   � {link}\n\n"
 
     if erros > 0:
         msg += f"⚠️ {erros} foto(s) não puderam ser lidas.\n\n"
 
-    msg += f"👇 Toque para abrir no Google Maps:\n{maps_url}"
+    dupes = len(pacotes) - len(pacotes_unicos)
+    if dupes > 0:
+        msg += f"♻️ {dupes} endereço(s) duplicado(s) removidos.\n\n"
 
-    await update.message.reply_text(msg)
+    # Link de rota completa no final (opcional)
+    enderecos = [p["endereco"] for p in pacotes_ordenados]
+    destinos = "/".join([quote(e, safe="") for e in enderecos])
+    rota_url = "https://www.google.com/maps/dir//" + destinos
+    msg += f"🚗 Rota completa (todas as paradas):\n{rota_url}"
+
+    # Divide mensagem se exceder limite do Telegram (4096 chars)
+    if len(msg) <= 4096:
+        await update.message.reply_text(msg)
+    else:
+        # Envia paradas em blocos + link da rota separado
+        partes = msg.rsplit("\n🚗", 1)
+        texto_paradas = partes[0]
+
+        # Divide texto das paradas em chunks de ~4000 chars
+        while texto_paradas:
+            if len(texto_paradas) <= 4096:
+                await update.message.reply_text(texto_paradas)
+                texto_paradas = ""
+            else:
+                corte = texto_paradas.rfind("\n\n", 0, 4096)
+                if corte == -1:
+                    corte = 4096
+                await update.message.reply_text(texto_paradas[:corte])
+                texto_paradas = texto_paradas[corte:].lstrip("\n")
+
+        # Envia link da rota completa em mensagem separada
+        if len(partes) > 1:
+            await update.message.reply_text("🚗" + partes[1])
 
     # Limpa as fotos após gerar a rota
     user_photos[user_id] = []
+
 
 # ── Extrai endereço via Claude Vision com retry ──
 async def extrair_info(client: httpx.AsyncClient, image_b64: str):
