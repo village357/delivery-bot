@@ -2,3 +2,5 @@ python-telegram-bot==20.7
 httpx==0.25.2
 folium
 polyline
+flask
+pgeocode
