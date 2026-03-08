@@ -4,16 +4,22 @@ import base64
 import asyncio
 import json
 import logging
-import tempfile
+import uuid
+import time
+import threading
 from urllib.parse import quote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
 import folium
-from folium import IFrame
+from folium import Element
 import polyline as polyline_decoder
+import pgeocode
+from flask import Flask, Response, abort
 
-# Logging para debug no Railway
+# ══════════════════════════════════════════════════
+#  CONFIGURAÇÃO
+# ══════════════════════════════════════════════════
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -24,17 +30,73 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 MODEL = "claude-opus-4-5"
 MAX_RETRIES = 3
+PORT = int(os.environ.get("PORT", 8080))
+
+# URL base do Railway (detecta automaticamente)
+RAILWAY_URL = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+if RAILWAY_URL and not RAILWAY_URL.startswith("http"):
+    RAILWAY_URL = f"https://{RAILWAY_URL}"
 
 # Armazena fotos por usuario
 user_photos = {}
 
-# ── Cores para marcadores e rotas ──
+# Armazena mapas gerados (id -> html_content)
+mapas_gerados = {}
+MAPA_TTL = 86400  # 24 horas em segundos
+
+# Geocoder offline para CEPs brasileiros
+nomi = pgeocode.Nominatim("br")
+
+# Cores para marcadores
 MARKER_COLORS = [
     "#E63946", "#457B9D", "#2A9D8F", "#E9C46A", "#F4A261",
     "#264653", "#6A0572", "#AB83A1", "#FF6B6B", "#4ECDC4",
 ]
 
-# ── /start ──
+
+# ══════════════════════════════════════════════════
+#  FLASK WEB SERVER — serve os mapas
+# ══════════════════════════════════════════════════
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/health")
+def health():
+    return "OK", 200
+
+
+@flask_app.route("/mapa/<mapa_id>")
+def servir_mapa(mapa_id):
+    """Serve o mapa HTML interativo pelo ID."""
+    entry = mapas_gerados.get(mapa_id)
+    if not entry:
+        abort(404)
+
+    # Checa expiração
+    if time.time() - entry["criado_em"] > MAPA_TTL:
+        del mapas_gerados[mapa_id]
+        abort(404)
+
+    return Response(entry["html"], mimetype="text/html")
+
+
+def limpar_mapas_expirados():
+    """Remove mapas com mais de 24h."""
+    agora = time.time()
+    expirados = [k for k, v in mapas_gerados.items() if agora - v["criado_em"] > MAPA_TTL]
+    for k in expirados:
+        del mapas_gerados[k]
+
+
+def rodar_flask():
+    """Roda o Flask em thread separada."""
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
+# ══════════════════════════════════════════════════
+#  COMANDOS DO BOT
+# ══════════════════════════════════════════════════
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 Olá! Sou seu assistente de rotas de entrega.\n\n"
@@ -42,13 +104,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Escreva o número do pacote a caneta na etiqueta\n"
         "2️⃣ Tire a foto e mande aqui (pode mandar várias de uma vez)\n"
         "3️⃣ Digite /rota para gerar a rota organizada\n\n"
-        "🗺️ Agora com MAPA INTERATIVO! Todos os pontos plotados de uma vez!\n\n"
+        "🗺️ Agora com MAPA INTERATIVO! Todos os pontos no mapa de uma vez!\n\n"
         "Outros comandos:\n"
         "📊 /status — ver quantas fotos já foram enviadas\n"
         "🗑️ /limpar — apagar tudo e começar do zero"
     )
 
-# ── /status ──
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     fotos = user_photos.get(user_id, [])
@@ -64,19 +126,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Pode mandar mais ou digitar /rota para gerar a rota!"
         )
 
-# ── /limpar ──
+
 async def limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_photos[user_id] = []
     await update.message.reply_text("🗑️ Fotos limpas! Pode mandar as novas.")
 
-# ── Recebe foto ──
+
 async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_photos:
         user_photos[user_id] = []
 
-    # Pega a maior resolução disponível
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
 
@@ -91,20 +152,74 @@ async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Manda mais ou digita /rota para gerar a rota."
     )
 
-# ── Extrai CEP numérico do endereço para ordenação ──
-def extrair_cep_numerico(endereco):
-    """Extrai o CEP do endereço e retorna como número para ordenação."""
+
+# ══════════════════════════════════════════════════
+#  GEOCODIFICAÇÃO — BrasilAPI + pgeocode (fallback)
+# ══════════════════════════════════════════════════
+
+def extrair_cep(endereco):
+    """Extrai o CEP do endereço."""
     match = re.search(r"(\d{5})-?(\d{3})", endereco)
     if match:
-        return int(match.group(1) + match.group(2))
-    return 99999999  # Coloca no final se não encontrar CEP
+        return match.group(1) + match.group(2)  # sem hífen: 13670744
+    return None
 
 
-# ══════════════════════════════════════════════════
-#  GEOCODIFICAÇÃO — Converte endereço em lat/lng
-# ══════════════════════════════════════════════════
-async def geocodificar(client: httpx.AsyncClient, endereco: str):
-    """Geocodifica um endereço usando Nominatim (OpenStreetMap)."""
+def extrair_cep_numerico(endereco):
+    """Extrai o CEP como número para ordenação."""
+    cep = extrair_cep(endereco)
+    if cep:
+        return int(cep)
+    return 99999999
+
+
+async def geocodificar_brasilapi(client: httpx.AsyncClient, cep: str):
+    """Geocodifica usando BrasilAPI CEP v2 — retorna lat/lng direto do CEP."""
+    try:
+        cep_formatado = cep.replace("-", "").strip()
+        response = await client.get(
+            f"https://brasilapi.com.br/api/cep/v2/{cep_formatado}",
+            timeout=10,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            loc = data.get("location", {})
+            coords = loc.get("coordinates", {})
+            lat = coords.get("latitude")
+            lng = coords.get("longitude")
+            if lat is not None and lng is not None:
+                logger.info(f"BrasilAPI OK para CEP {cep_formatado}: {lat}, {lng}")
+                return {"lat": float(lat), "lng": float(lng)}
+            else:
+                logger.warning(f"BrasilAPI sem coords para CEP {cep_formatado}")
+        else:
+            logger.warning(f"BrasilAPI status {response.status_code} para CEP {cep_formatado}")
+    except Exception as e:
+        logger.error(f"BrasilAPI erro: {e}")
+    return None
+
+
+def geocodificar_pgeocode(cep: str):
+    """Geocodifica usando pgeocode (offline) — fallback."""
+    try:
+        cep_formatado = cep.replace("-", "").strip()
+        # pgeocode espera CEP com 5 dígitos (prefixo)
+        cep5 = cep_formatado[:5]
+        result = nomi.query_postal_code(cep5)
+        if result is not None and not (result["latitude"] != result["latitude"]):  # NaN check
+            lat = float(result["latitude"])
+            lng = float(result["longitude"])
+            logger.info(f"pgeocode OK para CEP {cep5}: {lat}, {lng}")
+            return {"lat": lat, "lng": lng}
+        else:
+            logger.warning(f"pgeocode sem coords para CEP {cep5}")
+    except Exception as e:
+        logger.error(f"pgeocode erro: {e}")
+    return None
+
+
+async def geocodificar_nominatim(client: httpx.AsyncClient, endereco: str):
+    """Geocodifica usando Nominatim — último fallback."""
     try:
         response = await client.get(
             "https://nominatim.openstreetmap.org/search",
@@ -114,53 +229,54 @@ async def geocodificar(client: httpx.AsyncClient, endereco: str):
                 "limit": 1,
                 "countrycodes": "br",
             },
-            headers={"User-Agent": "RoboRotaBot/1.0"},
+            headers={"User-Agent": "RoboRotaBot/2.0"},
+            timeout=10,
         )
         data = response.json()
         if data:
-            return {
-                "lat": float(data[0]["lat"]),
-                "lng": float(data[0]["lon"]),
-            }
-        # Tenta com endereço simplificado (só rua + cidade + CEP)
-        partes = endereco.split(",")
-        if len(partes) >= 3:
-            simples = ", ".join([partes[0].strip(), partes[-2].strip(), partes[-1].strip()])
-            response2 = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": simples,
-                    "format": "json",
-                    "limit": 1,
-                    "countrycodes": "br",
-                },
-                headers={"User-Agent": "RoboRotaBot/1.0"},
-            )
-            data2 = response2.json()
-            if data2:
-                return {
-                    "lat": float(data2[0]["lat"]),
-                    "lng": float(data2[0]["lon"]),
-                }
-        logger.warning(f"Geocodificação falhou para: {endereco}")
-        return None
+            lat = float(data[0]["lat"])
+            lng = float(data[0]["lon"])
+            logger.info(f"Nominatim OK para: {endereco[:40]}... -> {lat}, {lng}")
+            return {"lat": lat, "lng": lng}
     except Exception as e:
-        logger.error(f"Erro na geocodificação: {e}")
-        return None
+        logger.error(f"Nominatim erro: {e}")
+    return None
+
+
+async def geocodificar(client: httpx.AsyncClient, endereco: str):
+    """
+    Geocodifica com estratégia de fallback:
+    1. BrasilAPI CEP v2 (mais confiável para Brasil)
+    2. pgeocode offline (rápido, sem rede)
+    3. Nominatim (último recurso)
+    """
+    cep = extrair_cep(endereco)
+
+    if cep:
+        # 1. BrasilAPI
+        coords = await geocodificar_brasilapi(client, cep)
+        if coords:
+            return coords
+
+        # 2. pgeocode offline
+        coords = geocodificar_pgeocode(cep)
+        if coords:
+            return coords
+
+    # 3. Nominatim (último recurso)
+    coords = await geocodificar_nominatim(client, endereco)
+    return coords
 
 
 # ══════════════════════════════════════════════════
-#  OSRM — Otimiza a ordem da rota (TSP)
+#  OSRM — Otimiza rota e obtém geometria
 # ══════════════════════════════════════════════════
+
 async def otimizar_rota_osrm(client: httpx.AsyncClient, coordenadas):
-    """
-    Usa OSRM Trip API para resolver o problema do caixeiro viajante (TSP).
-    Retorna as coordenadas e índices na ordem otimizada.
-    """
+    """Usa OSRM Trip API para resolver TSP."""
     if len(coordenadas) < 2:
         return list(range(len(coordenadas)))
 
-    # Formata coordenadas para OSRM: lng,lat;lng,lat;...
     coords_str = ";".join([f"{c['lng']},{c['lat']}" for c in coordenadas])
 
     try:
@@ -177,11 +293,8 @@ async def otimizar_rota_osrm(client: httpx.AsyncClient, coordenadas):
         )
         data = response.json()
 
-        if data.get("code") == "Ok" and data.get("trips"):
-            # Extrai a ordem otimizada dos waypoints
-            waypoints = data["trips"][0].get("legs", [])
-            trip_waypoints = data.get("waypoints", [])
-            ordem = [wp["waypoint_index"] for wp in trip_waypoints]
+        if data.get("code") == "Ok" and data.get("waypoints"):
+            ordem = [wp["waypoint_index"] for wp in data["waypoints"]]
             return ordem
         else:
             logger.warning(f"OSRM Trip falhou: {data.get('code', 'unknown')}")
@@ -191,16 +304,10 @@ async def otimizar_rota_osrm(client: httpx.AsyncClient, coordenadas):
         return list(range(len(coordenadas)))
 
 
-# ══════════════════════════════════════════════════
-#  OSRM — Busca a geometria da rota ponto a ponto
-# ══════════════════════════════════════════════════
 async def obter_rota_osrm(client: httpx.AsyncClient, coordenadas_ordenadas):
-    """
-    Busca a geometria da rota completa via OSRM Route API.
-    Retorna lista de pontos [lat, lng] para desenhar no mapa.
-    """
+    """Busca geometria da rota via OSRM Route API."""
     if len(coordenadas_ordenadas) < 2:
-        return []
+        return {"pontos": [], "duracao_min": 0, "distancia_km": 0}
 
     coords_str = ";".join([f"{c['lng']},{c['lat']}" for c in coordenadas_ordenadas])
 
@@ -218,11 +325,8 @@ async def obter_rota_osrm(client: httpx.AsyncClient, coordenadas_ordenadas):
 
         if data.get("code") == "Ok" and data.get("routes"):
             geometry = data["routes"][0]["geometry"]
-            # Decodifica polyline para lista de [lat, lng]
             pontos = polyline_decoder.decode(geometry)
-            # Duração total em minutos
             duracao = data["routes"][0].get("duration", 0) / 60
-            # Distância total em km
             distancia = data["routes"][0].get("distance", 0) / 1000
             return {
                 "pontos": pontos,
@@ -238,178 +342,210 @@ async def obter_rota_osrm(client: httpx.AsyncClient, coordenadas_ordenadas):
 # ══════════════════════════════════════════════════
 #  GERA MAPA INTERATIVO COM FOLIUM (Leaflet.js)
 # ══════════════════════════════════════════════════
+
 def gerar_mapa_html(pacotes_com_coords, rota_info):
-    """
-    Gera um mapa HTML interativo com Leaflet.js usando Folium.
-    Mostra todos os pontos e a rota entre eles.
-    """
-    # Centro do mapa (média das coordenadas)
+    """Gera HTML do mapa interativo com Leaflet.js."""
+
     lats = [p["coords"]["lat"] for p in pacotes_com_coords]
     lngs = [p["coords"]["lng"] for p in pacotes_com_coords]
     center_lat = sum(lats) / len(lats)
     center_lng = sum(lngs) / len(lngs)
 
-    # Cria o mapa
     m = folium.Map(
         location=[center_lat, center_lng],
         zoom_start=13,
         tiles=None,
     )
 
-    # Adiciona tile layer com atribuição
+    # Tiles
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attr="© OpenStreetMap contributors",
-        name="OpenStreetMap",
+        attr="© OpenStreetMap",
+        name="Mapa",
     ).add_to(m)
 
-    # Adiciona tile layer escura como alternativa
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
         attr="© CartoDB",
         name="Modo Escuro",
     ).add_to(m)
 
-    # Adiciona controle de camadas
     folium.LayerControl().add_to(m)
 
-    # Desenha a rota se disponível
+    # Rota
     if rota_info and rota_info["pontos"]:
         folium.PolyLine(
             locations=rota_info["pontos"],
             color="#2563EB",
             weight=5,
             opacity=0.8,
-            dash_array="",
             tooltip=f"🚗 {rota_info['distancia_km']} km — ~{rota_info['duracao_min']} min",
         ).add_to(m)
 
-    # Adiciona marcadores numerados
+    # Marcadores
     for i, p in enumerate(pacotes_com_coords):
         lat = p["coords"]["lat"]
         lng = p["coords"]["lng"]
         num_label = i + 1
         cor = MARKER_COLORS[i % len(MARKER_COLORS)]
 
-        # Popup com informações
         num_pacote = f" — Pacote {p['numero']}" if p.get("numero") else ""
+        gmaps_link = "https://www.google.com/maps/search/" + quote(p["endereco"], safe="")
+
         popup_html = f"""
-        <div style="font-family: 'Segoe UI', sans-serif; min-width: 220px;">
-            <div style="background: {cor}; color: white; padding: 8px 12px;
-                        border-radius: 8px 8px 0 0; font-weight: bold; font-size: 14px;">
+        <div style="font-family: -apple-system, 'Segoe UI', sans-serif; min-width: 240px; "
+        "border-radius: 12px; overflow: hidden;">
+            <div style="background: {cor}; color: white; padding: 10px 14px; font-weight: 700; font-size: 15px;">
                 📍 Parada {num_label}{num_pacote}
             </div>
-            <div style="padding: 10px 12px; font-size: 13px; line-height: 1.5;">
-                <b>Bairro:</b> {p.get('bairro', '—')}<br>
-                <b>Endereço:</b> {p['endereco']}<br>
-                <a href="https://www.google.com/maps/search/{quote(p['endereco'], safe='')}"
-                   target="_blank"
-                   style="color: #2563EB; text-decoration: none; font-weight: bold;">
-                   🔗 Abrir no Google Maps
+            <div style="padding: 12px 14px; font-size: 13px; line-height: 1.6; background: #fff;">
+                <b>Bairro:</b> {p.get('bairro') or '—'}<br>
+                <b>Endereço:</b> {p['endereco']}<br><br>
+                <a href="{gmaps_link}" target="_blank"
+                   style="display: inline-block; background: #4285F4; color: white;
+                          padding: 8px 16px; border-radius: 20px; text-decoration: none;
+                          font-weight: 600; font-size: 13px;">
+                   🗺️ Abrir no Google Maps
                 </a>
             </div>
         </div>
         """
 
-        # Marcador com número
         icon_html = f"""
         <div style="
             background: {cor};
             color: white;
             border: 3px solid white;
             border-radius: 50%;
-            width: 32px;
-            height: 32px;
+            width: 36px;
+            height: 36px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-weight: bold;
-            font-size: 14px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            font-weight: 800;
+            font-size: 15px;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+            cursor: pointer;
         ">{num_label}</div>
         """
 
         folium.Marker(
             location=[lat, lng],
-            popup=folium.Popup(popup_html, max_width=300),
-            tooltip=f"Parada {num_label}: {p.get('bairro', p['endereco'][:30])}",
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"📍 Parada {num_label}: {p.get('bairro') or p['endereco'][:25]}",
             icon=folium.DivIcon(
                 html=icon_html,
-                icon_size=(32, 32),
-                icon_anchor=(16, 16),
+                icon_size=(36, 36),
+                icon_anchor=(18, 18),
             ),
         ).add_to(m)
 
-    # Ajusta o zoom para mostrar todos os pontos
-    m.fit_bounds([[min(lats) - 0.005, min(lngs) - 0.005],
-                  [max(lats) + 0.005, max(lngs) + 0.005]])
+    # Fit bounds
+    m.fit_bounds([
+        [min(lats) - 0.008, min(lngs) - 0.008],
+        [max(lats) + 0.008, max(lngs) + 0.008]
+    ])
 
-    # Adiciona painel de informações
+    # Info panel
     duracao = rota_info.get("duracao_min", 0) if rota_info else 0
     distancia = rota_info.get("distancia_km", 0) if rota_info else 0
     total = len(pacotes_com_coords)
 
+    # Lista de paradas para o painel lateral
+    paradas_html = ""
+    for i, p in enumerate(pacotes_com_coords):
+        cor = MARKER_COLORS[i % len(MARKER_COLORS)]
+        num_pacote = f" (Pacote {p['numero']})" if p.get("numero") else ""
+        paradas_html += f"""
+        <div style="display: flex; align-items: center; gap: 10px; padding: 8px 0;
+                    border-bottom: 1px solid #eee;">
+            <div style="background: {cor}; color: white; min-width: 28px; height: 28px;
+                        border-radius: 50%; display: flex; align-items: center;
+                        justify-content: center; font-weight: 700; font-size: 13px;">
+                {i + 1}
+            </div>
+            <div style="font-size: 12px; line-height: 1.4;">
+                <b>{p.get('bairro') or '—'}</b>{num_pacote}<br>
+                <span style="color: #666;">{p['endereco'][:50]}...</span>
+            </div>
+        </div>
+        """
+
     info_html = f"""
-    <div style="
+    <div id="info-panel" style="
         position: fixed;
         bottom: 20px;
         left: 20px;
         z-index: 9999;
-        background: rgba(255,255,255,0.95);
-        border-radius: 12px;
-        padding: 16px 20px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-        font-family: 'Segoe UI', sans-serif;
-        max-width: 280px;
-        backdrop-filter: blur(10px);
+        background: rgba(255,255,255,0.97);
+        border-radius: 16px;
+        padding: 0;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+        font-family: -apple-system, 'Segoe UI', sans-serif;
+        max-width: 320px;
+        max-height: 70vh;
+        overflow: hidden;
+        backdrop-filter: blur(12px);
     ">
-        <div style="font-size: 16px; font-weight: bold; margin-bottom: 8px; color: #1a1a2e;">
-            🚚 Rota de Entregas
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    color: white; padding: 16px 20px; border-radius: 16px 16px 0 0;">
+            <div style="font-size: 18px; font-weight: 800; margin-bottom: 4px;">
+                🚚 Rota de Entregas
+            </div>
+            <div style="font-size: 13px; opacity: 0.9; display: flex; gap: 16px;">
+                <span>📍 {total} paradas</span>
+                <span>🛣️ {distancia} km</span>
+                <span>⏱️ ~{duracao} min</span>
+            </div>
         </div>
-        <div style="font-size: 13px; color: #555; line-height: 1.8;">
-            📍 <b>{total}</b> parada(s)<br>
-            🛣️ <b>{distancia}</b> km total<br>
-            ⏱️ <b>~{duracao}</b> min estimado
+        <div style="padding: 12px 16px; max-height: 40vh; overflow-y: auto;">
+            {paradas_html}
+        </div>
+        <div style="padding: 10px 16px; text-align: center; border-top: 1px solid #eee;">
+            <span style="font-size: 11px; color: #999;">Toque nos marcadores para detalhes</span>
         </div>
     </div>
     """
-    m.get_root().html.add_child(folium.Element(info_html))
+    m.get_root().html.add_child(Element(info_html))
 
-    # Adiciona título
-    title_html = f"""
-    <div style="
-        position: fixed;
-        top: 10px;
-        left: 50%;
-        transform: translateX(-50%);
-        z-index: 9999;
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        color: white;
-        border-radius: 30px;
-        padding: 10px 24px;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-        font-family: 'Segoe UI', sans-serif;
-        font-size: 14px;
-        font-weight: bold;
-        white-space: nowrap;
-    ">
-        📦 Robo Rota — {total} entregas
-    </div>
+    # Toggle button para mobile (minimizar/expandir painel)
+    toggle_js = """
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        var panel = document.getElementById('info-panel');
+        if (panel && window.innerWidth < 600) {
+            // Em mobile, começa minimizado
+            var content = panel.querySelector('div:nth-child(2)');
+            var footer = panel.querySelector('div:nth-child(3)');
+            if (content) content.style.display = 'none';
+            if (footer) footer.style.display = 'none';
+
+            panel.querySelector('div:first-child').addEventListener('click', function() {
+                if (content) {
+                    content.style.display = content.style.display === 'none' ? 'block' : 'none';
+                }
+                if (footer) {
+                    footer.style.display = footer.style.display === 'none' ? 'block' : 'none';
+                }
+            });
+            panel.querySelector('div:first-child').style.cursor = 'pointer';
+        }
+    });
+    </script>
     """
-    m.get_root().html.add_child(folium.Element(title_html))
+    m.get_root().html.add_child(Element(toggle_js))
 
-    # Salva em arquivo temporário
-    tmp_file = tempfile.NamedTemporaryFile(
-        suffix=".html", prefix="rota_", delete=False, mode="w", encoding="utf-8"
-    )
-    m.save(tmp_file.name)
-    tmp_file.close()
-    return tmp_file.name
+    # Meta viewport para mobile
+    meta = '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
+    m.get_root().html.add_child(Element(meta))
+
+    return m._repr_html_()
 
 
 # ══════════════════════════════════════════════════
 #  /rota — GERA ROTA + MAPA INTERATIVO
 # ══════════════════════════════════════════════════
+
 async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     fotos = user_photos.get(user_id, [])
@@ -421,7 +557,7 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"🔍 Analisando {len(fotos)} foto(s)... Aguarda um momento!"
+        f"🔍 Analisando {len(fotos)} foto(s) com IA... Aguarda!"
     )
 
     # 1. Extrai endereços via Claude Vision
@@ -439,8 +575,7 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not pacotes:
         await update.message.reply_text(
-            "❌ Não consegui ler nenhum endereço nas fotos. "
-            "Tente fotos mais nítidas e bem iluminadas."
+            "❌ Não consegui ler nenhum endereço. Tente fotos mais nítidas."
         )
         return
 
@@ -452,26 +587,24 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chave not in vistos:
             vistos.add(chave)
             pacotes_unicos.append(p)
-        else:
-            logger.info(f"Duplicata removida: {p['endereco']}")
 
     dupes = len(pacotes) - len(pacotes_unicos)
 
     await update.message.reply_text(
-        f"📍 {len(pacotes_unicos)} endereço(s) extraído(s)! Geocodificando e otimizando rota..."
+        f"📍 {len(pacotes_unicos)} endereço(s)! Buscando coordenadas GPS..."
     )
 
-    # 3. Geocodifica todos os endereços (sequencial por rate limit Nominatim: 1 req/s)
+    # 3. Geocodifica (BrasilAPI → pgeocode → Nominatim)
     coordenadas = []
     async with httpx.AsyncClient(timeout=60) as client:
         for p in pacotes_unicos:
             result = await geocodificar(client, p["endereco"])
             coordenadas.append(result)
-            # Rate limit do Nominatim: 1 req/s
+            # Rate limit entre requests
             if len(coordenadas) < len(pacotes_unicos):
-                await asyncio.sleep(1.1)
+                await asyncio.sleep(0.5)
 
-    # Filtra apenas pacotes com geocodificação bem-sucedida
+    # Filtra pacotes geocodificados
     pacotes_com_coords = []
     pacotes_sem_coords = []
     for p, coord in zip(pacotes_unicos, coordenadas):
@@ -482,34 +615,48 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pacotes_sem_coords.append(p)
 
     if not pacotes_com_coords:
-        # Fallback: envia apenas links do Google Maps
         await update.message.reply_text(
-            "⚠️ Não consegui geocodificar os endereços para o mapa. "
-            "Enviando links individuais como alternativa..."
+            "⚠️ Não consegui localizar os endereços no mapa. "
+            "Enviando links individuais..."
         )
         await _enviar_links_texto(update, pacotes_unicos, erros, dupes)
         user_photos[user_id] = []
         return
 
-    # 4. Otimiza a ordem da rota via OSRM
+    await update.message.reply_text("🛣️ Otimizando rota e gerando mapa...")
+
+    # 4. Otimiza ordem via OSRM Trip
     async with httpx.AsyncClient(timeout=30) as client:
         coords_para_otimizar = [p["coords"] for p in pacotes_com_coords]
         ordem = await otimizar_rota_osrm(client, coords_para_otimizar)
 
-    # Reordena os pacotes pela rota otimizada
     pacotes_ordenados = [pacotes_com_coords[i] for i in ordem]
 
-    # 5. Obtém geometria da rota para desenhar no mapa
+    # 5. Obtém geometria da rota
     async with httpx.AsyncClient(timeout=30) as client:
         coords_ordenadas = [p["coords"] for p in pacotes_ordenados]
         rota_info = await obter_rota_osrm(client, coords_ordenadas)
 
-    # 6. Gera mapa HTML interativo
-    mapa_path = gerar_mapa_html(pacotes_ordenados, rota_info)
+    # 6. Gera mapa HTML e salva no servidor
+    html_content = gerar_mapa_html(pacotes_ordenados, rota_info)
+    mapa_id = str(uuid.uuid4())[:8]
+    mapas_gerados[mapa_id] = {
+        "html": html_content,
+        "criado_em": time.time(),
+    }
 
-    # 7. Envia mensagem texto com lista
+    # Limpa mapas antigos
+    limpar_mapas_expirados()
+
+    # 7. Monta URL do mapa
+    if RAILWAY_URL:
+        mapa_url = f"{RAILWAY_URL}/mapa/{mapa_id}"
+    else:
+        mapa_url = f"http://localhost:{PORT}/mapa/{mapa_id}"
+
+    # 8. Envia mensagem com lista + link do mapa
     total = len(pacotes_ordenados)
-    msg = f"🗺️ Rota otimizada — {total} parada(s):\n\n"
+    msg = f"🗺️ ROTA OTIMIZADA — {total} parada(s)\n\n"
 
     for i, p in enumerate(pacotes_ordenados, 1):
         num = f" [Pacote {p['numero']}]" if p["numero"] is not None else ""
@@ -520,17 +667,15 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"   🔗 {link}\n\n"
 
     if rota_info and rota_info["pontos"]:
-        msg += f"🛣️ Distância total: {rota_info['distancia_km']} km\n"
-        msg += f"⏱️ Tempo estimado: ~{rota_info['duracao_min']} min\n\n"
+        msg += f"🛣️ Distância: {rota_info['distancia_km']} km\n"
+        msg += f"⏱️ Tempo: ~{rota_info['duracao_min']} min\n\n"
 
     if erros > 0:
         msg += f"⚠️ {erros} foto(s) não puderam ser lidas.\n"
-
     if dupes > 0:
-        msg += f"♻️ {dupes} endereço(s) duplicado(s) removidos.\n"
-
+        msg += f"♻️ {dupes} duplicata(s) removida(s).\n"
     if pacotes_sem_coords:
-        msg += f"\n⚠️ {len(pacotes_sem_coords)} endereço(s) não puderam ser plotados no mapa.\n"
+        msg += f"📌 {len(pacotes_sem_coords)} endereço(s) sem localização no mapa.\n"
 
     # Divide mensagem se necessário
     if len(msg) <= 4096:
@@ -547,35 +692,19 @@ async def gerar_rota(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(msg[:corte])
                 msg = msg[corte:].lstrip("\n")
 
-    # 8. Envia mapa como documento HTML
-    try:
-        with open(mapa_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="rota_entregas.html",
-                caption=(
-                    "🗺️ Mapa interativo com todas as paradas!\n"
-                    "Abra no navegador para ver todos os pontos e a rota no mapa."
-                ),
-            )
-    except Exception as e:
-        logger.error(f"Erro ao enviar mapa: {e}")
-        await update.message.reply_text(
-            "⚠️ Não consegui enviar o mapa HTML. Use os links individuais acima."
-        )
-    finally:
-        # Limpa arquivo temporário
-        try:
-            os.unlink(mapa_path)
-        except Exception:
-            pass
+    # Envia link do mapa interativo
+    await update.message.reply_text(
+        f"🗺️ MAPA INTERATIVO — Toque para abrir:\n\n"
+        f"👉 {mapa_url}\n\n"
+        "✅ Abre no navegador com zoom, clique nos pontos e rota completa!\n"
+        "⏳ O link expira em 24h."
+    )
 
-    # Limpa fotos após gerar a rota
     user_photos[user_id] = []
 
 
 async def _enviar_links_texto(update, pacotes, erros, dupes):
-    """Fallback: envia apenas links individuais do Google Maps."""
+    """Fallback: envia apenas links individuais."""
     pacotes_ordenados = sorted(pacotes, key=lambda p: extrair_cep_numerico(p["endereco"]))
     total = len(pacotes_ordenados)
     msg = f"🗺️ Rota — {total} parada(s):\n\n"
@@ -591,7 +720,7 @@ async def _enviar_links_texto(update, pacotes, erros, dupes):
     if erros > 0:
         msg += f"⚠️ {erros} foto(s) não puderam ser lidas.\n"
     if dupes > 0:
-        msg += f"♻️ {dupes} endereço(s) duplicado(s) removidos.\n"
+        msg += f"♻️ {dupes} duplicata(s) removida(s).\n"
 
     if len(msg) <= 4096:
         await update.message.reply_text(msg)
@@ -608,7 +737,10 @@ async def _enviar_links_texto(update, pacotes, erros, dupes):
                 msg = msg[corte:].lstrip("\n")
 
 
-# ── Extrai endereço via Claude Vision com retry ──
+# ══════════════════════════════════════════════════
+#  CLAUDE VISION — Extrai endereço da etiqueta
+# ══════════════════════════════════════════════════
+
 async def extrair_info(client: httpx.AsyncClient, image_b64: str):
     for tentativa in range(1, MAX_RETRIES + 1):
         try:
@@ -640,12 +772,16 @@ async def extrair_info(client: httpx.AsyncClient, image_b64: str):
                                     "Pode ter um número escrito a caneta pelo entregador (ex: 6, 12, 35). "
                                     "Extraia APENAS o endereço do DESTINATÁRIO (ignore completamente o remetente). "
                                     "Responda APENAS em formato JSON assim:\n"
-                                    "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", \"endereco\": \"Rua Jose Vencel, 36, Jardim Planalto, Santa Rita do Passa Quatro, SP, 13670-744\"}\n"
+                                    "{\"numero\": 6, \"bairro\": \"Jardim Planalto\", "
+                                    "\"endereco\": \"Rua Jose, 36, Jardim, Cidade, SP, 13670-744\"}\n"
                                     "REGRAS CRÍTICAS para o campo 'endereco':\n"
-                                    "1. Formato: Rua, Numero, Bairro, Cidade, UF, CEP (sem a palavra CEP, só os números)\n"
-                                    "2. NUNCA escreva o nome completo do estado (ex: nunca 'São Paulo', nunca 'Minas Gerais') — use SEMPRE só a sigla de 2 letras (SP, MG, RJ, etc.)\n"
-                                    "3. Inclua o CEP sem a palavra 'CEP' — só os números com hífen (ex: 13670-744)\n"
-                                    "4. O CEP é o dado mais importante pois garante que o Maps encontre a cidade certa\n"
+                                    "1. Formato: Rua, Numero, Bairro, Cidade, UF, CEP "
+                                    "(sem a palavra CEP, só números)\n"
+                                    "2. NUNCA escreva o nome completo do estado "
+                                    "(nunca 'São Paulo') — use SEMPRE sigla de 2 letras (SP, MG, RJ)\n"
+                                    "3. Inclua o CEP sem a palavra 'CEP' — só os números com hífen\n"
+                                    "4. O CEP é o dado mais importante pois garante "
+                                    "que o Maps encontre a cidade certa\n"
                                     "5. Se não tiver número escrito a caneta, coloque null no campo 'numero'\n"
                                     "6. Se não encontrar endereço, responda apenas: NAO_ENCONTRADO"
                                 )
@@ -656,7 +792,6 @@ async def extrair_info(client: httpx.AsyncClient, image_b64: str):
             )
             data = response.json()
 
-            # Checa erro da API
             if "error" in data:
                 logger.warning(f"Erro da API (tentativa {tentativa}): {data['error']}")
                 if tentativa < MAX_RETRIES:
@@ -669,13 +804,10 @@ async def extrair_info(client: httpx.AsyncClient, image_b64: str):
             if "NAO_ENCONTRADO" in text:
                 return None
 
-            # Remove markdown se vier com ```json
             text = text.replace("```json", "").replace("```", "").strip()
-
             info = json.loads(text)
             endereco = info.get("endereco", "").strip()
 
-            # Valida que o endereço não está vazio
             if not endereco:
                 logger.warning("Endereço vazio retornado pelo Claude")
                 return None
@@ -701,16 +833,28 @@ async def extrair_info(client: httpx.AsyncClient, image_b64: str):
 
     return None
 
-# ── Main ──
+
+# ══════════════════════════════════════════════════
+#  MAIN — Roda Flask + Telegram Bot
+# ══════════════════════════════════════════════════
+
 def main():
+    # Inicia Flask em thread separada
+    flask_thread = threading.Thread(target=rodar_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"Flask rodando na porta {PORT}")
+
+    # Inicia Telegram bot
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("limpar", limpar))
     app.add_handler(CommandHandler("rota", gerar_rota))
     app.add_handler(MessageHandler(filters.PHOTO, receber_foto))
-    logger.info("Bot rodando com mapa interativo Leaflet.js + OSRM...")
+
+    logger.info("Bot V2 rodando com mapa interativo via web server!")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
